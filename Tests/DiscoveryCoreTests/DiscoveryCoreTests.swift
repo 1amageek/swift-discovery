@@ -257,6 +257,62 @@ struct MessageTests {
         #expect(message.header.recipientID.isBroadcast)
     }
 
+    @Test("Message totalSize matches actual serialized size")
+    func testMessageTotalSizeAccuracy() throws {
+        let senderID = PeerID("long-sender-name")
+        let recipientID = PeerID("long-recipient-name")
+        let payload = "Test payload data with some content".data(using: .utf8)!
+
+        let message = Message.create(
+            type: .invoke,
+            senderID: senderID,
+            recipientID: recipientID,
+            sequenceNumber: 12345,
+            payload: payload
+        )
+
+        let serialized = try message.serialize()
+        #expect(message.totalSize == serialized.count)
+    }
+
+    @Test("Message minimumSize is correct")
+    func testMessageMinimumSize() {
+        // Minimum size = fixed header (20 bytes) + 2 length bytes for empty peer IDs
+        #expect(Message.minimumSize == MessageHeader.fixedSize + 2)
+        #expect(Message.minimumSize == 22)
+    }
+
+    @Test("MessageHeader serializedSize is accurate")
+    func testMessageHeaderSerializedSize() throws {
+        let shortSender = PeerID("a")
+        let shortRecipient = PeerID("b")
+        let longSender = PeerID("this-is-a-longer-sender-name")
+        let longRecipient = PeerID("this-is-a-longer-recipient-name")
+
+        let shortHeader = MessageHeader(
+            type: .ping,
+            senderID: shortSender,
+            recipientID: shortRecipient,
+            sequenceNumber: 1,
+            payloadLength: 0
+        )
+
+        let longHeader = MessageHeader(
+            type: .ping,
+            senderID: longSender,
+            recipientID: longRecipient,
+            sequenceNumber: 1,
+            payloadLength: 0
+        )
+
+        let shortSerialized = try shortHeader.serialize()
+        let longSerialized = try longHeader.serialize()
+
+        #expect(shortHeader.serializedSize == shortSerialized.count)
+        #expect(longHeader.serializedSize == longSerialized.count)
+        #expect(longHeader.serializedSize > shortHeader.serializedSize)
+    }
+
     @Test("Message type names")
     func testMessageTypeNames() {
         #expect(MessageType.announce.name == "ANNOUNCE")

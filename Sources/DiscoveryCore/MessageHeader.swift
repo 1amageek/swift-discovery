@@ -37,8 +37,10 @@ public struct MessageHeader: Sendable, Hashable {
     /// fixedSize + 2 length bytes + 63*2 peer name bytes
     public static let maxSize = fixedSize + 2 + 63 + 63
 
-    /// Minimum serialized size (with 1-char peer names)
-    public static var size: Int { fixedSize + 4 }  // minimum with empty names
+    /// Minimum serialized size (with empty peer names)
+    /// Note: Use `serializedSize` property for actual header size calculation
+    @available(*, deprecated, message: "Use serializedSize property for accurate size calculation")
+    public static var size: Int { fixedSize + 2 }  // fixed + 2 length bytes (empty names)
 
     /// Current protocol version
     public static let currentVersion: UInt8 = 1
@@ -112,22 +114,22 @@ extension MessageHeader {
         offset += 1
 
         let flags = MessageFlags(rawValue: data.subdata(in: offset..<offset+2).withUnsafeBytes {
-            UInt16(bigEndian: $0.load(as: UInt16.self))
+            UInt16(bigEndian: $0.loadUnaligned(as: UInt16.self))
         })
         offset += 2
 
         let sequenceNumber = data.subdata(in: offset..<offset+4).withUnsafeBytes {
-            UInt32(bigEndian: $0.load(as: UInt32.self))
+            UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self))
         }
         offset += 4
 
         let timestamp = data.subdata(in: offset..<offset+8).withUnsafeBytes {
-            UInt64(bigEndian: $0.load(as: UInt64.self))
+            UInt64(bigEndian: $0.loadUnaligned(as: UInt64.self))
         }
         offset += 8
 
         let payloadLength = data.subdata(in: offset..<offset+4).withUnsafeBytes {
-            UInt32(bigEndian: $0.load(as: UInt32.self))
+            UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self))
         }
         offset += 4
 

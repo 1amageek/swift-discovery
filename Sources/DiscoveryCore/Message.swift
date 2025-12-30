@@ -11,13 +11,13 @@ public struct Message: Sendable, Hashable {
     /// Message payload (variable length)
     public let payload: Data
 
-    /// Total message size in bytes
+    /// Total message size in bytes (actual serialized size)
     public var totalSize: Int {
-        MessageHeader.size + payload.count
+        header.serializedSize + payload.count
     }
 
-    /// Minimum message size (header only, no payload)
-    public static let minimumSize = MessageHeader.size
+    /// Minimum message size (header with minimum peer ID lengths, no payload)
+    public static let minimumSize = MessageHeader.fixedSize + 2  // fixed + 2 length bytes for empty peer IDs
 
     /// Maximum payload size (1 MB)
     public static let maxPayloadSize = 1024 * 1024

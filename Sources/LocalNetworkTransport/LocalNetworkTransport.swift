@@ -6,6 +6,15 @@ import Foundation
 import Network
 import DiscoveryCore
 
+// MARK: - Service Endpoint
+
+/// Holds mDNS service endpoint components separately to avoid parsing issues
+private struct ServiceEndpoint: Sendable {
+    let name: String
+    let type: String
+    let domain: String
+}
+
 // MARK: - Local Network Transport
 
 /// Transport implementation for same-network peer discovery
@@ -40,10 +49,13 @@ public actor LocalNetworkTransport: Transport {
     private var knownPeers: [PeerID: ResolvedPeer] = [:]
 
     /// Internal endpoint mapping (transport-specific, not exposed)
-    private var peerEndpoints: [PeerID: String] = [:]
+    private var peerEndpoints: [PeerID: ServiceEndpoint] = [:]
 
     /// Active connections
     private var connections: [PeerID: NWConnection] = [:]
+
+    /// Receive buffers for each connection (for TCP framing)
+    private var receiveBuffers: [ObjectIdentifier: Data] = [:]
 
     /// Event continuation
     private var eventContinuation: AsyncStream<TransportEvent>.Continuation?
@@ -103,11 +115,12 @@ public actor LocalNetworkTransport: Transport {
         listener?.cancel()
         listener = nil
 
-        // Close all connections
+        // Close all connections and clear buffers
         for (_, connection) in connections {
             connection.cancel()
         }
         connections.removeAll()
+        receiveBuffers.removeAll()
         peerEndpoints.removeAll()
         knownPeers.removeAll()
 
@@ -426,7 +439,7 @@ public actor LocalNetworkTransport: Transport {
             }
 
             // Store endpoint internally (transport-specific, not exposed)
-            let endpoint = "\(name).\(type)\(domain)"
+            let endpoint = ServiceEndpoint(name: name, type: type, domain: domain)
             peerEndpoints[peerID] = endpoint
 
             let metadata = txtRecord["name"].map { ["name": $0] } ?? [:]
@@ -477,8 +490,8 @@ public actor LocalNetworkTransport: Transport {
             // Start receiving messages
             Task { await receiveMessages(on: connection) }
         case .failed, .cancelled:
-            // Clean up
-            break
+            // Clean up receive buffer
+            Task { await cleanupReceiveBuffer(for: connection) }
         default:
             break
         }
@@ -492,6 +505,8 @@ public actor LocalNetworkTransport: Transport {
                 let message = try Message.deserialize(from: data)
                 await handleMessage(message, from: connection)
             } catch {
+                // Clean up buffer on error
+                cleanupReceiveBuffer(for: connection)
                 break
             }
         }
@@ -572,15 +587,15 @@ public actor LocalNetworkTransport: Transport {
         }
 
         // Get internal endpoint (transport-specific)
-        guard let endpointString = peerEndpoints[peerID] else {
+        guard let serviceEndpoint = peerEndpoints[peerID] else {
             throw TransportError.resolutionFailed(peerID)
         }
 
-        // Create new connection
+        // Create new connection using stored endpoint components
         let endpoint = NWEndpoint.service(
-            name: endpointString.components(separatedBy: ".").first ?? "",
-            type: Self.serviceType,
-            domain: Self.serviceDomain,
+            name: serviceEndpoint.name,
+            type: serviceEndpoint.type,
+            domain: serviceEndpoint.domain,
             interface: nil
         )
 
@@ -602,9 +617,26 @@ public actor LocalNetworkTransport: Transport {
         }
     }
 
+    /// Length prefix size for TCP framing (4 bytes for UInt32)
+    private static let frameLengthSize = 4
+
+    /// Maximum frame size (header + payload, slightly larger than maxPayloadSize)
+    private static let maxFrameSize = Message.maxPayloadSize + MessageHeader.maxSize
+
     private func send(_ data: Data, on connection: NWConnection) async throws {
+        // Validate frame size before sending
+        guard data.count <= Self.maxFrameSize else {
+            throw TransportError.invalidData
+        }
+
+        // Create length-prefixed frame
+        var frame = Data()
+        var length = UInt32(data.count).bigEndian
+        frame.append(Data(bytes: &length, count: Self.frameLengthSize))
+        frame.append(data)
+
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.send(content: data, completion: .contentProcessed { error in
+            connection.send(content: frame, completion: .contentProcessed { error in
                 if let error = error {
                     continuation.resume(throwing: error)
                 } else {
@@ -616,18 +648,21 @@ public actor LocalNetworkTransport: Transport {
 
     private func receive(on connection: NWConnection, timeout: Duration) async throws -> Data {
         try await withThrowingTaskGroup(of: Data.self) { group in
-            group.addTask {
-                try await withCheckedThrowingContinuation { continuation in
-                    connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, error in
-                        if let error = error {
-                            continuation.resume(throwing: error)
-                        } else if let data = data {
-                            continuation.resume(returning: data)
-                        } else {
-                            continuation.resume(throwing: TransportError.timeout)
-                        }
-                    }
+            group.addTask { [self] in
+                // Read length prefix first (4 bytes)
+                let lengthData = try await self.receiveExact(on: connection, length: Self.frameLengthSize)
+                let messageLength = lengthData.withUnsafeBytes {
+                    UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self))
                 }
+
+                // Validate message length
+                guard messageLength > 0 && Int(messageLength) <= Self.maxFrameSize else {
+                    throw TransportError.invalidData
+                }
+
+                // Read the complete message
+                let messageData = try await self.receiveExact(on: connection, length: Int(messageLength))
+                return messageData
             }
 
             group.addTask {
@@ -641,5 +676,46 @@ public actor LocalNetworkTransport: Transport {
             group.cancelAll()
             return result
         }
+    }
+
+    /// Receive exactly the specified number of bytes, buffering as needed
+    private func receiveExact(on connection: NWConnection, length: Int) async throws -> Data {
+        let connectionID = ObjectIdentifier(connection)
+        var buffer = receiveBuffers[connectionID] ?? Data()
+        receiveBuffers[connectionID] = nil
+
+        while buffer.count < length {
+            let remaining = length - buffer.count
+            // Read in chunks, up to 64KB at a time or remaining amount
+            let chunkSize = min(remaining, 65536)
+
+            let chunk = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+                connection.receive(minimumIncompleteLength: 1, maximumLength: chunkSize) { data, _, _, error in
+                    if let error = error {
+                        continuation.resume(throwing: error)
+                    } else if let data = data, !data.isEmpty {
+                        continuation.resume(returning: data)
+                    } else {
+                        continuation.resume(throwing: TransportError.connectionClosed)
+                    }
+                }
+            }
+            buffer.append(chunk)
+        }
+
+        // If we received more than needed, store the excess for next read
+        if buffer.count > length {
+            let result = buffer.prefix(length)
+            receiveBuffers[connectionID] = Data(buffer.dropFirst(length))
+            return Data(result)
+        }
+
+        return buffer
+    }
+
+    /// Clean up receive buffer for a connection
+    private func cleanupReceiveBuffer(for connection: NWConnection) {
+        let connectionID = ObjectIdentifier(connection)
+        receiveBuffers.removeValue(forKey: connectionID)
     }
 }

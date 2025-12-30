@@ -94,11 +94,11 @@ public actor TransportCoordinator {
 
     /// Stop all transports
     public func stopAll() async throws {
-        // Cancel all event listeners
-        for (transportID, task) in eventListenerTasks {
+        // Cancel all event listeners (avoid modifying dictionary during iteration)
+        for task in eventListenerTasks.values {
             task.cancel()
-            eventListenerTasks.removeValue(forKey: transportID)
         }
+        eventListenerTasks.removeAll()
 
         for transport in transports.values {
             try await transport.stop()

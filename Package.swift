@@ -70,5 +70,9 @@ let package = Package(
             name: "DiscoveryCoreTests",
             dependencies: ["DiscoveryCore"]
         ),
+        .testTarget(
+            name: "LocalNetworkTransportTests",
+            dependencies: ["DiscoveryCore", "LocalNetworkTransport"]
+        ),
     ]
 )

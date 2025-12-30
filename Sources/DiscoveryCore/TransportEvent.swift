@@ -33,7 +33,9 @@ public enum TransportError: Error, Sendable {
     case notStarted
     case alreadyStarted
     case connectionFailed(String)
+    case connectionClosed
     case resolutionFailed(PeerID)
     case invocationFailed(InvocationError)
     case timeout
+    case invalidData
 }
